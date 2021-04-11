@@ -31,8 +31,8 @@ enum http_status {
 typedef struct {
     void *root;
     int fd;
-    int epfd;
-    char buf[MAX_BUF]; /* ring buffer */
+    int event_type;
+	char buf[MAX_BUF]; /* ring buffer */
     size_t pos, last;
     int state;
     void *request_start;
@@ -79,10 +79,9 @@ int http_close_conn(http_request_t *r);
 
 static inline void init_http_request(http_request_t *r,
                                      int fd,
-                                     int epfd,
                                      char *root)
 {
-    r->fd = fd, r->epfd = epfd;
+    r->fd = fd;
     r->pos = r->last = 0;
     r->state = 0;
     r->root = root;

@@ -3,7 +3,6 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -304,12 +303,6 @@ void do_request(void *ptr)
         }
         free(out);
     }
-
-    struct epoll_event event = {
-        .data.ptr = ptr,
-        .events = EPOLLIN | EPOLLET | EPOLLONESHOT,
-    };
-    epoll_ctl(r->epfd, EPOLL_CTL_MOD, r->fd, &event);
 
     add_timer(r, TIMEOUT_DEFAULT, http_close_conn);
     return;

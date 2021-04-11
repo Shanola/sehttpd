@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -13,8 +12,6 @@
 #include "logger.h"
 #include "timer.h"
 
-/* the length of the struct epoll_events array pointed to by *events */
-#define MAXEVENTS 1024
 
 #define LISTENQ 1024
 
@@ -89,81 +86,10 @@ int main()
     int rc UNUSED = sock_set_non_blocking(listenfd);
     assert(rc == 0 && "sock_set_non_blocking");
 
-    /* create epoll and add listenfd */
-    int epfd = epoll_create1(0 /* flags */);
-    assert(epfd > 0 && "epoll_create1");
-
-    struct epoll_event *events = malloc(sizeof(struct epoll_event) * MAXEVENTS);
-    assert(events && "epoll_event: malloc");
-
-    http_request_t *request = malloc(sizeof(http_request_t));
-    init_http_request(request, listenfd, epfd, WEBROOT);
-
-    struct epoll_event event = {
-        .data.ptr = request,
-        .events = EPOLLIN | EPOLLET,
-    };
-    epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &event);
-
     timer_init();
 
     printf("Web server started.\n");
 
-    /* epoll_wait loop */
-    while (1) {
-        int time = find_timer();
-        debug("wait time = %d", time);
-        int n = epoll_wait(epfd, events, MAXEVENTS, time);
-        handle_expired_timers();
-
-        for (int i = 0; i < n; i++) {
-            http_request_t *r = events[i].data.ptr;
-            int fd = r->fd;
-            if (listenfd == fd) {
-                /* we have one or more incoming connections */
-                while (1) {
-                    socklen_t inlen = 1;
-                    struct sockaddr_in clientaddr;
-                    int infd = accept(listenfd, (struct sockaddr *) &clientaddr,
-                                      &inlen);
-                    if (infd < 0) {
-                        if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
-                            /* we have processed all incoming connections */
-                            break;
-                        }
-                        log_err("accept");
-                        break;
-                    }
-
-                    rc = sock_set_non_blocking(infd);
-                    assert(rc == 0 && "sock_set_non_blocking");
-
-                    request = malloc(sizeof(http_request_t));
-                    if (!request) {
-                        log_err("malloc");
-                        break;
-                    }
-
-                    init_http_request(request, infd, epfd, WEBROOT);
-                    event.data.ptr = request;
-                    event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-                    epoll_ctl(epfd, EPOLL_CTL_ADD, infd, &event);
-
-                    add_timer(request, TIMEOUT_DEFAULT, http_close_conn);
-                }
-            } else {
-                if ((events[i].events & EPOLLERR) ||
-                    (events[i].events & EPOLLHUP) ||
-                    (!(events[i].events & EPOLLIN))) {
-                    log_err("epoll error fd: %d", r->fd);
-                    close(fd);
-                    continue;
-                }
-
-                do_request(events[i].data.ptr);
-            }
-        }
-    }
 
     return 0;
 }
