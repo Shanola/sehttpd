@@ -14,63 +14,73 @@
 
 #define LISTENQ 1024
 
-#define ACCEPT 0
-#define READ 1
-#define WRITE 2
+#define MAX_MESSAGE_LEN 2048
+#define IOURING_QUEUE_DEPTH 4096
 
-#define MAX_MESSAGE_LEN 4096
 
-#define IO_URING_QUEUE_DEPTH 4096
+enum {
+    ACCEPT,
+	READ,
+	WRITE,
+	PROV_BUF,
+};
 
-void add_request_accept(struct io_uring *ring, int sockfd, struct sockaddr *client_addr, socklen_t *client_len, unsigned flags)
+void add_request_accept(struct io_uring *ring, int sockfd, struct sockaddr_in *client_addr, socklen_t *client_len, unsigned flags)
 {
-    printf("Add accept\n");
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    
-	io_uring_prep_accept(sqe, sockfd, client_addr, client_len, 0);
+
+	http_request_t *req = malloc(sizeof(http_request_t) + sizeof(struct iovec));
+	req->fd = sockfd;
+	req->event_type = ACCEPT;
+	io_uring_prep_accept(sqe, sockfd, (struct sockaddr *)client_addr, client_len, 0);
+	io_uring_sqe_set_data(sqe, req);
+
+	io_uring_submit(ring);
+}
+
+void add_request_read(struct io_uring *ring, int fd, unsigned msg_size, unsigned flags, char *root)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+	
+	http_request_t *req = malloc(sizeof(http_request_t) + sizeof(struct iovec));
+	req->fd = fd;
+	req->event_type = READ;
+	req->iov[0].iov_base = malloc(sizeof(char) * msg_size);
+	req->iov[0].iov_len = msg_size;
+	memset(req->iov[0].iov_base, 0, msg_size);
+	io_uring_prep_readv(sqe, fd, &req->iov[0], 1, 0);
+	io_uring_sqe_set_data(sqe, req);
+
+	io_uring_submit(ring);
+}
+
+void add_request_write(struct io_uring *ring, int fd, int bid, unsigned msg_size, unsigned flags, struct iovec iov[])
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+	
+	http_request_t *req = malloc(sizeof(http_request_t) + sizeof(struct iovec));
+	req->fd = fd;
+	req->event_type = WRITE;
+	io_uring_prep_writev(sqe, fd, iov, 1, 0);
+	io_uring_sqe_set_data(sqe, req);
+	
+	io_uring_submit(ring);
+}
+
+/*void add_request_provide_buffers(struct io_uring *ring, unsigned msg_size, int buf_cnt, int gid, int bid)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+	
+	io_uring_prep_provide_buffers(sqe, buffers[bid], msg_size, buf_cnt, gid, bid);
 
 	http_request_t req = {
-	.fd = sockfd,
-	.event_type = ACCEPT,
+	    .fd = 0,
+		.event_type = PROV_BUF,
 	};
 	io_uring_sqe_set_data(sqe, &req);
 
-	// io_uring_sqe_set_flags(sqe, flags);
 	io_uring_submit(ring);
-}
-
-void add_request_read(struct io_uring *ring, int fd, void *buf, unsigned msg_size, unsigned flags, char *root)
-{
-    printf("Add read\n");
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-	
-	io_uring_prep_recv(sqe, fd, buf, msg_size, 0);
-	
-	http_request_t req;
-	init_http_request(&req, fd, root);
-	req.event_type = READ;
-	io_uring_sqe_set_data(sqe, &req);
-	
-	// io_uring_sqe_set_flags(sqe, flags);
-	io_uring_submit(ring);
-}
-
-void add_request_write(struct io_uring *ring, int fd, void *buf, unsigned msg_size, unsigned flags)
-{
-    printf("Add write\n");
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-	
-	io_uring_prep_send(sqe, fd, buf, msg_size, 0);
-
-	http_request_t req = {
-	.fd = fd,
-	.event_type = WRITE,
-	};
-	io_uring_sqe_set_data(sqe, &req);
-	
-	// io_uring_sqe_set_flags(sqe, flags);
-	io_uring_submit(ring);
-}
+}*/
 
 static int open_listenfd(int port)
 {
@@ -102,34 +112,15 @@ static int open_listenfd(int port)
     return listenfd;
 }
 
-/* set a socket non-blocking. If a listen socket is a blocking socket, after
- * it comes out from epoll and accepts the last connection, the next accpet
- * will block unexpectedly.
- */
-static int sock_set_non_blocking(int fd)
-{
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) {
-        log_err("fcntl");
-        return -1;
-    }
-
-    flags |= O_NONBLOCK;
-    int s = fcntl(fd, F_SETFL, flags);
-    if (s == -1) {
-        log_err("fcntl");
-        return -1;
-    }
-    return 0;
-}
-
 /* TODO: use command line options to specify */
 #define PORT 8081
 #define WEBROOT "./www"
 
+//char buffers[LISTENQ][MAX_MESSAGE_LEN] = {};
+
 int main()
 {
-    char buf[MAX_MESSAGE_LEN];
+    // int group_id = 0;
     /* when a fd is closed by remote, writing to this fd will cause system
      * send SIGPIPE to this process, which exit the program
      */
@@ -146,58 +137,68 @@ int main()
 	
 	struct io_uring ring;
 
-	if (io_uring_queue_init(IO_URING_QUEUE_DEPTH, &ring, 0) != 0) {
+	if (io_uring_queue_init(IOURING_QUEUE_DEPTH, &ring, 0) != 0) {
 	    printf("io_uring init failed.\n");
 		return EXIT_FAILURE;
 	}
+	printf("Server started.\n");
+	
+	/*struct io_uring_cqe *cqe;
+    add_request_provide_buffers(&ring, MAX_MESSAGE_LEN, LISTENQ, group_id, 0);
+    io_uring_wait_cqe(&ring, &cqe);
+	if(cqe->res < 0) {
+	    printf("provide buffer error, cqe->res = %d\n", cqe->res);
+		return EXIT_FAILURE;
+	}
+	io_uring_cqe_seen(&ring, cqe);*/
+	
 	struct sockaddr_in client_addr;
 	socklen_t client_len = sizeof(client_addr);
-    
-	printf("Web server started.\n");
-	
-	add_request_accept(&ring, listenfd, (struct sockaddr *)&client_addr, &client_len, 0);
+	add_request_accept(&ring, listenfd, &client_addr, &client_len, 0);
 
 	while (1) {
 	    io_uring_submit_and_wait(&ring, 1);
-		struct io_uring_cqe *cqe;
+        struct io_uring_cqe *cqe;
 		unsigned head;
 		unsigned count = 0;
-
 		io_uring_for_each_cqe(&ring, head, cqe) {
-		    ++count;
-			http_request_t *request = io_uring_cqe_get_data(cqe);
-			int event_type = request->event_type;
-			printf("event type = %d\n", event_type);
-			switch (event_type) {
+		    count++;	
+		    http_request_t *request = io_uring_cqe_get_data(cqe);
+		    printf("EVENT: %d\n", request->event_type);
+		    switch (request->event_type) {
 			    case ACCEPT:
-					add_request_accept(&ring, listenfd, (struct sockaddr *)&client_addr, &client_len, 0);
-					int clientfd = cqe->res; /* cqe->res might be client fd*/
-					if (clientfd >= 0) { /* TODO: check contain "=" or not */
-				        add_request_read(&ring, clientfd, buf, MAX_MESSAGE_LEN, 0, WEBROOT);
-					}
-					break;
-				case READ:
+			        add_request_accept(&ring, listenfd, &client_addr, &client_len, 0);
+				    /* cqe->res might be client fd */
+				    if (cqe->res >= 0) { /* TODO: check contain "=" or not */
+					    add_request_read(&ring, cqe->res, MAX_MESSAGE_LEN, 0, WEBROOT);
+				    }
+				    break;
+			    case READ:
 				    /* cqe->res is number of bytes that server read */
-					if (cqe->res > 0) {
-					    printf("read %d bytes\n", cqe->res);
-						char *s = "Hello";
-					    add_request_write(&ring, request->fd, buf, strlen(s), 0);
-						//http_do_request(request, &ring);
-					} else {
+				    if (cqe->res > 0) {
+					    //int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+					    add_request_write(&ring, request->fd, 0, cqe->res, 0, request->iov);
+				    } else {
 					    printf("res = %d, close connection.\n", cqe->res);
+					    //shutdown(request->fd, SHUT_RDWR);
 					    close(request->fd);
-					}
-
-					break;
-				case WRITE: /* TODO: keep-alive check */
+				    }
+				    break;
+			    case WRITE: /* TODO: keep-alive check */
 				    /* cqe->res is number of bytes that server wrote */
-					if (cqe->res >= 0) {
-					    add_request_read(&ring, request->fd, buf, MAX_MESSAGE_LEN, 0, WEBROOT);
-					}
-					break;
-			}
+				    if (cqe->res >= 0) {
+					    //add_request_provide_buffers(&ring, MAX_MESSAGE_LEN, 1, group_id, request->bid);
+					    add_request_read(&ring, request->fd, MAX_MESSAGE_LEN, 0, WEBROOT);
+				    }
+				    break;
+			    /*case PROV_BUF:
+			        if (cqe->res < 0) {
+					    printf("provide buffers error, exit");
+					    return EXIT_FAILURE;
+				    }
+				    break;*/
+		    }
 		}
-		//printf("%d request completed\n", count);
 		io_uring_cq_advance(&ring, count);
 	}
     return 0;
