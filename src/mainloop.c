@@ -12,7 +12,7 @@
 #include "logger.h"
 #include "timer.h"
 
-#define LISTENQ 1024
+#define LISTENQ 4096
 
 #define MAX_MESSAGE_LEN 2048
 #define IOURING_QUEUE_DEPTH 4096
@@ -37,7 +37,7 @@ void add_request_accept(struct io_uring *ring, int sockfd, struct sockaddr_in *c
 	io_uring_prep_accept(sqe, sockfd, (struct sockaddr *)client_addr, client_len, 0);
 	io_uring_sqe_set_data(sqe, req);
 
-	io_uring_submit(ring);
+    io_uring_submit(ring);
 }
 
 void add_request_read(struct io_uring *ring, int fd, unsigned msg_size, unsigned flags, char *root, int gid)
@@ -45,7 +45,7 @@ void add_request_read(struct io_uring *ring, int fd, unsigned msg_size, unsigned
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
 	sqe->buf_group = gid;
 	http_request_t *req = malloc(sizeof(http_request_t) + sizeof(struct iovec));
-	req->fd = fd;
+	init_http_request(req, fd, root);
 	req->event_type = READ;
 	io_uring_prep_recv(sqe, fd, NULL, msg_size, 0);
 	io_uring_sqe_set_flags(sqe, flags);
@@ -54,7 +54,7 @@ void add_request_read(struct io_uring *ring, int fd, unsigned msg_size, unsigned
 	io_uring_submit(ring);
 }
 
-void add_request_write(struct io_uring *ring, int fd, int bid, unsigned msg_size, unsigned flags)
+void add_request_write(struct io_uring *ring, int fd, int bid, void *msg, unsigned msg_size, unsigned flags)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
 	
@@ -62,7 +62,7 @@ void add_request_write(struct io_uring *ring, int fd, int bid, unsigned msg_size
 	req->fd = fd;
 	req->event_type = WRITE;
 	req->bid = bid;
-	io_uring_prep_send(sqe, fd, &buffers[bid], msg_size, 0);
+	io_uring_prep_send(sqe, fd, /*&buffers[bid]*/msg, msg_size, 0);
 	io_uring_sqe_set_data(sqe, req);
 	
 	io_uring_submit(ring);
@@ -112,7 +112,7 @@ static int open_listenfd(int port)
 }
 
 /* TODO: use command line options to specify */
-#define PORT 8081
+#define PORT 8085
 #define WEBROOT "./www"
 
 int main()
@@ -155,53 +155,73 @@ int main()
 	add_request_accept(&ring, listenfd, &client_addr, &client_len, 0);
 
 	while (1) {
-	    io_uring_submit_and_wait(&ring, 1);
-        struct io_uring_cqe *cqe;
-		unsigned head;
-		unsigned count = 0;
-		io_uring_for_each_cqe(&ring, head, cqe) {
-		    count++;	
-		    http_request_t *request = io_uring_cqe_get_data(cqe);
-			if (cqe->res == -ENOBUFS) {
-			    printf("Error: no buffer space available\n");
-				return EXIT_FAILURE;
-			}
-		    printf("EVENT: %d\n", request->event_type);
-		    switch (request->event_type) {
-			    case ACCEPT:
-			        add_request_accept(&ring, listenfd, &client_addr, &client_len, 0);
-				    /* cqe->res might be client fd */
-				    if (cqe->res >= 0) { /* TODO: check contain "=" or not */
-					    add_request_read(&ring, cqe->res, MAX_MESSAGE_LEN, IOSQE_BUFFER_SELECT, WEBROOT, group_id);
-				    }
-				    break;
-			    case READ:
-				    /* cqe->res is number of bytes that server read */
-				    if (cqe->res > 0) {
-					    int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-					    add_request_write(&ring, request->fd, bid, cqe->res, 0);
-				    } else {
-					    printf("cqe->res = %d, close fd=%d.\n", cqe->res, request->fd);
-					    //shutdown(request->fd, SHUT_RDWR);
-					    close(request->fd);
-				    }
-				    break;
-			    case WRITE: /* TODO: keep-alive check */
-				    /* cqe->res is number of bytes that server wrote */
-				    if (cqe->res >= 0) {
-					    add_request_provide_buffers(&ring, MAX_MESSAGE_LEN, 1, group_id, request->bid);
-					    add_request_read(&ring, request->fd, MAX_MESSAGE_LEN, IOSQE_BUFFER_SELECT, WEBROOT, group_id);
-				    }
-				    break;
-			    case PROV_BUF:
-			        if (cqe->res < 0) {
-					    printf("Error: provide buffers");
-					    return EXIT_FAILURE;
-				    }
-				    break;
-		    }
+	    //io_uring_submit_and_wait(&ring, 1);
+        //struct io_uring_cqe *cqe;
+		//unsigned head;
+		//unsigned count = 0;
+		//io_uring_for_each_cqe(&ring, head, cqe) {
+		//    count++;	
+		int ret = io_uring_wait_cqe(&ring, &cqe);
+		if (ret < 0) {
+		    printf("error when wait cqe\n");
+			return EXIT_FAILURE;
 		}
-		io_uring_cq_advance(&ring, count);
+		http_request_t *request = io_uring_cqe_get_data(cqe);
+		if (cqe->res == -ENOBUFS) {
+		    printf("Error: no buffer space available\n");
+			return EXIT_FAILURE;
+		}
+	    printf("fd: %d / ", request->fd);
+		if (request->event_type == 0) {
+		    printf("0 accepted, clientfd = %d", cqe->res);
+		} else if (request->event_type == 1) {
+		    printf("1 read");
+		} else if (request->event_type == 2) {
+		    printf("2 wrote");
+		} else if (request->event_type == 3) {
+		    printf("3 provided");
+		}
+		printf("\n");
+	    switch (request->event_type) {
+		    case ACCEPT:
+		        add_request_accept(&ring, listenfd, &client_addr, &client_len, 0);
+			    /* cqe->res might be client fd */
+			    if (cqe->res >= 0) { /* TODO: check contain "=" or not */
+				    add_request_read(&ring, cqe->res, MAX_MESSAGE_LEN, IOSQE_BUFFER_SELECT, WEBROOT, group_id);
+			    }
+			    break;
+		    case READ:
+			    /* cqe->res is number of bytes that server read */
+			    if (cqe->res > 0) {
+				    int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+					printf("---\n\n%s---\n", buffers[bid]);
+				    http_do_request(cqe->res, request, bid, buffers[bid], &ring, MAX_MESSAGE_LEN, group_id);
+					//add_request_write(&ring, request->fd, bid, cqe->res, 0);
+			    } else {
+				    printf("errno = %d, close fd=%d.\n", cqe->res, request->fd);
+				    shutdown(request->fd, SHUT_RDWR);
+					//close(request->fd);
+			    }
+			    break;
+		    case WRITE: /* TODO: keep-alive check */
+			    /* cqe->res is number of bytes that server wrote */
+			    if (cqe->res > 0) {
+				    add_request_provide_buffers(&ring, MAX_MESSAGE_LEN, 1, group_id, request->bid);
+				    add_request_read(&ring, request->fd, MAX_MESSAGE_LEN, IOSQE_BUFFER_SELECT, WEBROOT, group_id);
+			    } else {
+				    printf("Hey!!! Got you\n"); //TODO
+				}
+			    break;
+		    case PROV_BUF:
+		        if (cqe->res < 0) {
+				    printf("Error: provide buffers");
+				    return EXIT_FAILURE;
+			    }
+			    break;
+	    }
+		//}
+		//io_uring_cq_advance(&ring, count);
+		io_uring_cqe_seen(&ring, cqe);
 	}
     return 0;
 }

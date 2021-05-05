@@ -1,3 +1,4 @@
+#include <sys/sendfile.h>
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -85,7 +86,6 @@ static void parse_uri(char *uri, int uri_length, char *filename)
     debug("before strncat, filename = %s, uri = %.*s, file_len = %d", filename,
           file_length, uri, file_length);
     strncat(filename, uri, file_length);
-
     char *last_comp = strrchr(filename, '/');
     char *last_dot = strrchr(last_comp, '.');
     if (!last_dot && filename[strlen(filename) - 1] != '/')
@@ -152,8 +152,10 @@ static const char *get_msg_from_status(int status_code)
 
 static void serve_static(int fd,
                          char *filename,
+						 int bid,
                          size_t filesize,
-                         http_out_t *out)
+                         http_out_t *out,
+						 struct io_uring *ring)
 {
     char header[MAXLINE];
 
@@ -181,25 +183,23 @@ static void serve_static(int fd,
 
     sprintf(header, "%sServer: seHTTPd\r\n", header);
     sprintf(header, "%s\r\n", header);
+	add_request_write(ring, fd, bid, header, strlen(header), 0);
 
-    size_t n = (size_t) writen(fd, header, strlen(header));
-    assert(n == strlen(header) && "writen error");
-    if (n != strlen(header)) {
-        log_err("n != strlen(header)");
+    if (!out->modified) {
+	    printf("not modified, no need to send page.\n");
         return;
-    }
-
-    if (!out->modified)
-        return;
-
+	}
     int srcfd = open(filename, O_RDONLY, 0);
     assert(srcfd > 2 && "open error");
     /* TODO: use sendfile(2) for zero-copy support */
+	/*int n = sendfile(fd, srcfd, 0, filesize);
+	assert(n == filesize && "sendfile");
+	close(srcfd);*/
     char *srcaddr = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
     assert(srcaddr != (void *) -1 && "mmap error");
     close(srcfd);
-
-    writen(fd, srcaddr, filesize);
+	add_request_write(ring, fd, bid, srcaddr, filesize, 0);
+    //writen(fd, srcaddr, filesize);
 
     munmap(srcaddr, filesize);
 }
@@ -213,98 +213,83 @@ static inline int init_http_out(http_out_t *o, int fd)
     return 0;
 }
 
-void do_request(void *ptr)
+void http_do_request(int nbytes, void *ptr, int bid, char *bufp, struct io_uring *ring, int msg_size, int gid)
 {
     http_request_t *r = ptr;
     int fd = r->fd;
     int rc;
     char filename[SHORTLINE];
     webroot = r->root;
-
-    del_timer(r);
-    for (;;) {
-        char *plast = &r->buf[r->last % MAX_BUF];
-        size_t remain_size =
-            MIN(MAX_BUF - (r->last - r->pos) - 1, MAX_BUF - r->last % MAX_BUF);
-
-        int n = read(fd, plast, remain_size);
-        assert(r->last - r->pos < MAX_BUF && "request buffer overflow!");
-
-        if (n == 0) /* EOF */
-            goto err;
-
-        if (n < 0) {
-            if (errno != EAGAIN) {
-                log_err("read err, and errno = %d", errno);
-                goto err;
-            }
-            break;
-        }
-
-        r->last += n;
-        assert(r->last - r->pos < MAX_BUF && "request buffer overflow!");
-
-        /* about to parse request line */
-        rc = http_parse_request_line(r);
-        if (rc == EAGAIN)
-            continue;
-        if (rc != 0) {
-            log_err("rc != 0");
-            goto err;
-        }
-
-        debug("uri = %.*s", (int) (r->uri_end - r->uri_start),
-              (char *) r->uri_start);
-
-        rc = http_parse_request_body(r);
-        if (rc == EAGAIN)
-            continue;
-        if (rc != 0) {
-            log_err("rc != 0");
-            goto err;
-        }
-
-        /* handle http header */
-        http_out_t *out = malloc(sizeof(http_out_t));
-        if (!out) {
-            log_err("no enough space for http_out_t");
-            exit(1);
-        }
-
-        init_http_out(out, fd);
-
-        parse_uri(r->uri_start, r->uri_end - r->uri_start, filename);
-
-        struct stat sbuf;
-        if (stat(filename, &sbuf) < 0) {
-            do_error(fd, filename, "404", "Not Found", "Can't find the file");
-            continue;
-        }
-
-        if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) {
-            do_error(fd, filename, "403", "Forbidden", "Can't read the file");
-            continue;
-        }
-
-        out->mtime = sbuf.st_mtime;
-
-        http_handle_header(r, out);
-        assert(list_empty(&(r->list)) && "header list should be empty");
-
-        if (!out->status)
-            out->status = HTTP_OK;
-
-        serve_static(fd, filename, sbuf.st_size, out);
-
-        if (!out->keep_alive) {
-            debug("no keep_alive! ready to close");
-            free(out);
-            goto close;
-        }
-        free(out);
+	r->last = nbytes;
+	r->buf = bufp;
+    
+	//del_timer(r);
+    
+    /* about to parse request line */
+    rc = http_parse_request_line(r);
+    /*if (rc == EAGAIN) {
+		continue;
+	}*/
+    if (rc != 0) {
+        printf("rc = %d\n", rc);
+		log_err("rc != 0");
+		return; //TODO
+        goto err;
     }
 
-    add_timer(r, TIMEOUT_DEFAULT, http_close_conn);
+    debug("uri = %.*s", (int) (r->uri_end - r->uri_start),
+          (char *) r->uri_start);
+
+    rc = http_parse_request_body(r);
+    /*if (rc == EAGAIN)
+        continue;*/
+    if (rc != 0) {
+        printf("rc = %d, ", rc);
+        log_err("rc != 0");
+		return; //TODO
+        goto err;
+    }
+
+    /* handle http header */
+    http_out_t *out = malloc(sizeof(http_out_t));
+	if (!out) {
+        log_err("no enough space for http_out_t");
+        exit(1);
+    }
+    init_http_out(out, fd);
+	parse_uri(r->uri_start, r->uri_end - r->uri_start, filename);
+    struct stat sbuf;
+    if (stat(filename, &sbuf) < 0) {
+        do_error(fd, filename, "404", "Not Found", "Can't find the file");
+        //continue;
+		return;
+    }
+
+    if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) {
+        do_error(fd, filename, "403", "Forbidden", "Can't read the file");
+        //continue;
+		return;
+    }
+
+    out->mtime = sbuf.st_mtime;
+
+    http_handle_header(r, out);
+    assert(list_empty(&(r->list)) && "header list should be empty");
+
+    if (!out->status) {
+        out->status = HTTP_OK;
+	}
+    
+	serve_static(fd, filename, bid, sbuf.st_size, out, ring);
+    
+	if (!out->keep_alive) {
+        debug("no keep_alive! ready to close");
+        free(out);
+        goto close;
+    }
+    free(out);
+
+    //add_timer(r, TIMEOUT_DEFAULT, http_close_conn);
     return;
 
 err:
